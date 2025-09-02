@@ -21,7 +21,7 @@ import random
 import logging
 import asyncio
 from typing import Tuple, Optional, Dict, Any, List
-
+from datetime import datetime, timedelta
 import mysql.connector
 from mysql.connector import errorcode
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -262,15 +262,101 @@ class DatabaseManager:
         )
 
     def _sync_get_recent_summaries(self, days: int, limit: int) -> List[Dict[str, Any]]:
-        client = MongoClient(config.mongodb_connection_string, serverSelectionTimeoutMS=5000)
-        db = client[config.MONGODB_DATABASE]
-        collection = db[config.SUMMARIES_COLLECTION]
-        results = list(collection.find(
-            {"summary": {"$exists": True, "$ne": "", "$type": "string"}},
-            {"summary": 1, "timestamp": 1, "date": 1}
-        ).sort("timestamp", -1).limit(limit))
-        client.close()
-        return results
+        """Synchronous 7-day summaries retrieval with smart filtering"""
+        try:
+            from pymongo import MongoClient
+            
+            client = MongoClient(config.mongodb_connection_string, serverSelectionTimeoutMS=5000)
+            db = client[config.MONGODB_DATABASE]
+            collection = db[config.SUMMARIES_COLLECTION]
+            
+            # Calculate 7-day window
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
+            start_timestamp = start_date.timestamp()
+            
+            # Multiple query strategies for maximum 7-day coverage
+            query_strategies = [
+                {
+                    "name": "timestamp_based_7day",
+                    "filter": {
+                        "summary": {"$exists": True, "$ne": "", "$type": "string"},
+                        "timestamp": {"$gte": start_timestamp},
+                        "$expr": {"$gt": [{"$strLenCP": "$summary"}, config.MIN_CONTENT_LENGTH]}
+                    },
+                    "sort": [("timestamp", -1)]
+                },
+                {
+                    "name": "date_based_7day", 
+                    "filter": {
+                        "summary": {"$exists": True, "$ne": "", "$type": "string"},
+                        "date": {"$gte": start_date.strftime("%Y-%m-%d")},
+                        "$expr": {"$gt": [{"$strLenCP": "$summary"}, config.MIN_CONTENT_LENGTH]}
+                    },
+                    "sort": [("date", -1)]
+                },
+                {
+                    "name": "recent_quality_summaries",
+                    "filter": {
+                        "summary": {"$exists": True, "$ne": "", "$type": "string"},
+                        "$expr": {"$gt": [{"$strLenCP": "$summary"}, config.MIN_CONTENT_LENGTH * 2]}
+                    },
+                    "sort": [("_id", -1)]
+                },
+                {
+                    "name": "fallback_any_summaries",
+                    "filter": {
+                        "summary": {"$exists": True, "$ne": "", "$type": "string"}
+                    },
+                    "sort": [("_id", -1)]
+                }
+            ]
+            
+            summaries = []
+            
+            for strategy in query_strategies:
+                try:
+                    logger.info(f"🔍 Trying strategy: {strategy['name']}")
+                    
+                    cursor = collection.find(
+                        strategy["filter"],
+                        {
+                            "summary": 1,
+                            "timestamp": 1,
+                            "date": 1,
+                            "session_id": 1,
+                            "_id": 1
+                        }
+                    ).sort(strategy["sort"]).limit(limit)
+                    
+                    summaries = list(cursor)
+                    
+                    if summaries:
+                        logger.info(f"✅ Retrieved {len(summaries)} summaries using {strategy['name']}")
+                        break
+                        
+                except Exception as e:
+                    logger.warning(f"⚠️ Strategy {strategy['name']} failed: {e}")
+                    continue
+            
+            client.close()
+            
+            if not summaries:
+                raise Exception("No valid summaries found in database for 7-day interview processing")
+            
+            # Log sample for verification
+            if summaries:
+                first_summary = summaries[0]["summary"]
+                sample_length = min(len(first_summary), 200)
+                logger.info(f"📄 Sample summary ({sample_length} chars): {first_summary[:sample_length]}...")
+                logger.info(f"📊 Total summaries for interview: {len(summaries)}")
+            
+            return summaries
+            
+        except Exception as e:
+            logger.error(f"❌ Sync 7-day summary retrieval error: {e}")
+            raise Exception(f"MongoDB 7-day summary retrieval failed: {e}")
+
 
     # ------------------------------------------------------------------------
     # COMMON UTILITIES

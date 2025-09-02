@@ -76,6 +76,10 @@ class Config:
     def MONGO_CONNECTION_STRING(self) -> str:
         encoded_pass = quote_plus(self.MONGO_PASS)
         return f"mongodb://{self.MONGO_USER}:{encoded_pass}@{self.MONGO_HOST}/{self.MONGO_AUTH_SOURCE}"
+    @property
+    def GROQ_MODEL(self) -> str:
+    # Old code expects GROQ_MODEL; map to the new unified name
+       return getattr(self, "GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")    
 
     @property
     def mongodb_connection_string(self) -> str:
@@ -179,7 +183,7 @@ class Config:
     OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.1"))
     OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
-
+    
     GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
     GROQ_TIMEOUT = int(os.getenv("GROQ_TIMEOUT", "60"))
     GROQ_TEMPERATURE = float(os.getenv("GROQ_TEMPERATURE", "0.7"))

@@ -600,59 +600,97 @@ class WI_SharedClientManager:
 # global WI shared clients
 wi_shared_clients = WI_SharedClientManager()
 
+import time
+from typing import Dict, Optional, Any, List
+from core.config import config  # unified config
+import logging
+
+logger = logging.getLogger(__name__)
 
 class WI_EnhancedInterviewFragmentManager:
+    """Simplified fragment manager for interview content (WI version; same behavior as old weekly-interview)"""
+
     def __init__(self, client_manager: WI_SharedClientManager, session: WI_InterviewSession):
         self.client_manager = client_manager
         self.session = session
         self.fragments: Dict[str, Dict[str, Any]] = {}
+        self.used_concepts = set()  # kept for parity; not strictly used by the flow
 
     def initialize_fragments(self, summaries: List[Dict[str, Any]]) -> bool:
+        """Initialize fragments from 7-day summaries"""
         try:
             if not summaries:
                 return False
-            contents = []
-            for s in summaries:
-                content = s.get("summary", "")
+
+            # Process summaries into fragments (identical to old weekly-interview)
+            all_content: List[str] = []
+            for summary in summaries:
+                content = summary.get("summary", "")
                 if content and len(content) > config.MIN_CONTENT_LENGTH:
-                    contents.append(content)
-            if not contents:
+                    all_content.append(content)
+
+            if not all_content:
                 return False
-            for i, content in enumerate(contents[:config.MAX_INTERVIEW_FRAGMENTS]):
-                key = f"fragment_{i+1}"
-                self.fragments[key] = {"content": content, "used_count": 0, "last_used": 0}
+
+            # Create simple numbered fragments for easy management (same as old)
+            self.fragments.clear()
+            for i, content in enumerate(all_content[:config.MAX_INTERVIEW_FRAGMENTS]):
+                fragment_key = f"fragment_{i+1}"
+                self.fragments[fragment_key] = {
+                    "content": content,
+                    "used_count": 0,
+                    "last_used": 0,
+                }
+
             self.session.fragment_keys = list(self.fragments.keys())
-            self.session.content_context = "\n\n".join(contents)
-            logger.info(f"[WI] Initialized {len(self.fragments)} fragments")
+            self.session.content_context = "\n\n".join(all_content)
+
+            logger.info(f"[WI] Initialized {len(self.fragments)} fragments from {len(summaries)} summaries")
             return True
+
         except Exception as e:
-            logger.error(f"[WI] Fragment init failed: {e}")
+            logger.error(f"[WI] Fragment initialization failed: {e}")
             return False
 
     def get_next_concept(self, stage: WI_InterviewStage) -> Optional[str]:
+        """Get next concept for questioning (same round-robin selection as old)"""
         try:
-            available = [k for k, v in self.fragments.items() if v["used_count"] < config.MAX_QUESTIONS_PER_CONCEPT]
-            if not available:
-                for v in self.fragments.values():
-                    v["used_count"] = 0
-                available = list(self.fragments.keys())
-            if available:
-                sel = min(available, key=lambda k: self.fragments[k]["used_count"])
-                self.fragments[sel]["used_count"] += 1
-                self.fragments[sel]["last_used"] = time.time()
-                return sel
+            available_fragments = [
+                key for key, fragment in self.fragments.items()
+                if fragment["used_count"] < config.MAX_QUESTIONS_PER_CONCEPT
+            ]
+
+            if not available_fragments:
+                # Reset all fragments if we've exhausted them
+                for fragment in self.fragments.values():
+                    fragment["used_count"] = 0
+                available_fragments = list(self.fragments.keys())
+
+            if available_fragments:
+                # Select least-used fragment
+                selected = min(available_fragments, key=lambda k: self.fragments[k]["used_count"])
+                self.fragments[selected]["used_count"] += 1
+                self.fragments[selected]["last_used"] = time.time()
+                return selected
+
             return None
+
         except Exception as e:
             logger.warning(f"[WI] Concept selection error: {e}")
             return None
 
     def should_continue_round(self, stage: WI_InterviewStage) -> bool:
-        cur = self.session.questions_per_round.get(stage.value, 0)
+        """Determine if current round should continue (same as old)"""
+        current_questions = self.session.questions_per_round.get(stage.value, 0)
+        max_questions = config.QUESTIONS_PER_ROUND
+
         if stage == WI_InterviewStage.GREETING:
-            return cur < 2
-        return cur < config.QUESTIONS_PER_ROUND
+            return current_questions < 2
+
+        return current_questions < max_questions
 
     def add_question(self, question: str, concept: str, is_followup: bool = False):
+        """Track question usage (same as old)"""
         if concept in self.fragments:
             self.fragments[concept]["used_count"] += 1
 
