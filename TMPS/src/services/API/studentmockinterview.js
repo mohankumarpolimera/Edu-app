@@ -236,6 +236,8 @@ function createSilentAudioBlob() {
     console.error('Failed to create silent audio blob:', error);
     return new Blob([''], { type: 'audio/wav' });
   }
-}
+
+};
+
 
 export default interviewOperationsAPI;

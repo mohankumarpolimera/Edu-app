@@ -76,6 +76,7 @@ class Config:
     def MONGO_CONNECTION_STRING(self) -> str:
         encoded_pass = quote_plus(self.MONGO_PASS)
         return f"mongodb://{self.MONGO_USER}:{encoded_pass}@{self.MONGO_HOST}/{self.MONGO_AUTH_SOURCE}"
+    
     @property
     def GROQ_MODEL(self) -> str:
     # Old code expects GROQ_MODEL; map to the new unified name

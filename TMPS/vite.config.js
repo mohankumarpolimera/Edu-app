@@ -9,7 +9,7 @@ export default defineConfig({
       key: fs.readFileSync('./certs/key.pem'),
       cert: fs.readFileSync('./certs/cert.pem'),
     },
-    host: true, // or '0.0.0.0' if you prefer
+    host: true,
     proxy: {
       '/api': {
         target: 'https://192.168.48.201:8070',

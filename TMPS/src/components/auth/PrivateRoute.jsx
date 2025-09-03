@@ -1,39 +1,47 @@
+// src/routes/PrivateRoute.jsx
 import React from 'react';
-import { Navigate, useLocation } from 'react-router-dom';
+import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import { useAuth } from '../../hooks/useAuth';
 import LoadingSpinner from '../common/LoadingSpinner';
 
-const PrivateRoute = ({ children, allowedRoles = [] }) => {
+const isDev = import.meta?.env?.MODE !== 'production';
+
+const PrivateRoute = ({ children, allowedRoles = [], redirectTo = '/login' }) => {
   const { user, loading, isAuthenticated } = useAuth();
   const location = useLocation();
 
-  console.log('🔍 PrivateRoute - user:', user);
-  console.log('🔍 PrivateRoute - loading:', loading);
-  console.log('🔍 PrivateRoute - isAuthenticated:', isAuthenticated);
-  console.log('🔍 PrivateRoute - allowedRoles:', allowedRoles);
-  console.log('🔍 PrivateRoute - current location:', location.pathname);
+  if (isDev) {
+    console.log('🔍 PrivateRoute - user:', user);
+    console.log('🔍 PrivateRoute - loading:', loading);
+    console.log('🔍 PrivateRoute - isAuthenticated:', isAuthenticated);
+    console.log('🔍 PrivateRoute - allowedRoles:', allowedRoles);
+    console.log('🔍 PrivateRoute - current location:', location.pathname);
+  }
 
+  // Still determining auth
   if (loading) {
-    console.log('🔍 PrivateRoute - showing loading spinner');
+    if (isDev) console.log('🔍 PrivateRoute - showing loading spinner');
     return <LoadingSpinner message="Checking authentication..." />;
   }
 
+  // Not logged in
   if (!isAuthenticated) {
-    console.log('🔍 PrivateRoute - not authenticated, redirecting to login');
-    // Redirect to login page with return url
-    return <Navigate to="/login" state={{ from: location }} replace />;
+    if (isDev) console.log('🔍 PrivateRoute - not authenticated, redirecting to login');
+    return <Navigate to={redirectTo} state={{ from: location }} replace />;
   }
 
-  // Check if user role is allowed for this route
-  if (allowedRoles.length > 0 && !allowedRoles.includes(user?.role)) {
-    console.log('🔍 PrivateRoute - role not allowed, redirecting to user dashboard');
-    // Redirect to appropriate dashboard based on user role with /dashboard
-    const dashboardPath = `/${user?.role}/dashboard`;
+  // Role-based access (if specified)
+  const role = user?.role ?? '';
+  if (allowedRoles.length > 0 && !allowedRoles.includes(role)) {
+    if (isDev) console.log('🔍 PrivateRoute - role not allowed, redirecting to role dashboard');
+    const dashboardPath = role ? `/${role}/dashboard` : '/';
     return <Navigate to={dashboardPath} replace />;
   }
 
-  console.log('🔍 PrivateRoute - access granted, rendering children');
-  return children;
+  if (isDev) console.log('🔍 PrivateRoute - access granted, rendering children/outlet');
+
+  // Support both children and <Outlet /> usage
+  return children ?? <Outlet />;
 };
 
 export default PrivateRoute;

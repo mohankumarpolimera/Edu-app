@@ -5,7 +5,7 @@ import StudentDashboard from '../../components/student/StudentDashboard';
 
 const StudentDashboardPage = () => {
   return (
-    <Container maxWidth="xl" sx={{ py: 3 }}>
+    <Container >
       <StudentDashboard />
     </Container>
   );
