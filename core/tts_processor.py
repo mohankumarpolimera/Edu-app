@@ -1,186 +1,175 @@
-# Edu-app/core/tts_processor.py
-# Unified TTS processors for daily_standup and weekly_interview
-# Namespaced: DS_TTSProcessor, WI_TTSProcessor
-
-import re
+# core/tts_processor.py
+import io
+import glob
+import random
 import logging
-import asyncio
-import edge_tts
-from typing import List, AsyncGenerator
+from pathlib import Path
+from typing import AsyncGenerator, Dict, Optional
 
-from .config import config
+import torch
+from chatterbox.tts import ChatterboxTTS
+
+# Optional WAV writer (recommended)
+try:
+    import soundfile as sf  # pip install soundfile
+    HAVE_SF = True
+except Exception:
+    HAVE_SF = False
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# DAILY STANDUP VERSION
-# =============================================================================
 
-class DS_TTSProcessor:
+class UnifiedTTSProcessor:
     """
-    Ultra-fast TTS processor (Daily Standup version)
-    Uses static config values for voice & rate
-    """
-    def __init__(self):
-        self.voice = config.TTS_VOICE
-        self.rate = config.TTS_RATE
+    One TTS for Daily Standup + Weekly Interview using Chatterbox.
 
-    def split_text_optimized(self, text: str) -> List[str]:
-        """Optimized text splitting for minimal latency"""
-        sentences = re.split(r'[.!?]+', text)
-        chunks, current_chunk = [], ""
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            if len(current_chunk) + len(sentence) > config.TTS_CHUNK_SIZE * 5:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = sentence
+    - Picks one reference audio from ref_audios/ per session and keeps it fixed.
+    - Async streaming API: generate_ultra_fast_stream(text, session_id=...)
+      yields bytes chunks (WAV if soundfile is available, else raw PCM16).
+    - health_check() for readiness probes.
+    """
+    def __init__(
+        self,
+        ref_audio_dir: Path,
+        device: Optional[str] = None,
+        encode: str = "wav",           # "wav" or "pcm16"
+        chunk_tokens: int = 25,
+        temperature: float = 0.8,
+        cfg_weight: float = 0.5,
+    ):
+        self.ref_audio_dir = Path(ref_audio_dir)
+        self.encode = encode
+        self.chunk_tokens = chunk_tokens
+        self.temperature = temperature
+        self.cfg_weight = cfg_weight
+
+        # Device autodetect
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
             else:
-                current_chunk += " " + sentence if current_chunk else sentence
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
-        return chunks if chunks else [text]
+                device = "cpu"
+        self.device = device
 
-    async def generate_ultra_fast_stream(self, text: str) -> AsyncGenerator[bytes, None]:
-        """Ultra-fast audio generation with parallel processing"""
-        try:
-            chunks = self.split_text_optimized(text)
-            tasks = []
-            for i, chunk in enumerate(chunks):
-                if not chunk.strip():
-                    continue
-                if i == 0:
-                    async for audio_chunk in self._generate_chunk_audio(chunk):
-                        if audio_chunk:
-                            yield audio_chunk
-                else:
-                    tasks.append(self._generate_chunk_audio(chunk))
-            for task in tasks:
-                async for audio_chunk in task:
-                    if audio_chunk:
-                        yield audio_chunk
-        except Exception as e:
-            logger.error(f"[DS_TTS] Ultra-fast TTS error: {e}")
-            raise Exception(f"TTS generation failed: {e}")
+        logger.info("[TTS] Loading ChatterboxTTS on device=%s ...", self.device)
+        self.model = ChatterboxTTS.from_pretrained(device=self.device)  # exposes .sr
 
-    async def _generate_chunk_audio(self, chunk: str) -> AsyncGenerator[bytes, None]:
-        try:
-            tts = edge_tts.Communicate(chunk, self.voice, rate=self.rate)
-            audio_data = b""
-            async for tts_chunk in tts.stream():
-                if tts_chunk["type"] == "audio":
-                    audio_data += tts_chunk["data"]
-            if audio_data:
-                yield audio_data
-            else:
-                raise Exception("EdgeTTS returned empty audio data")
-        except Exception as e:
-            logger.error(f"[DS_TTS] Chunk error: {e}")
-            raise Exception(f"TTS chunk generation failed: {e}")
+        # session_id -> chosen audio_prompt_path
+        self._session_voice_map: Dict[str, Optional[str]] = {}
 
+        # Pre-scan reference audio pool
+        self._ref_pool = self._scan_ref_audios(self.ref_audio_dir)
+        if not self._ref_pool:
+            logger.warning("[TTS] No reference audios found in %s", self.ref_audio_dir)
 
-# =============================================================================
-# WEEKLY INTERVIEW VERSION
-# =============================================================================
-
-class WI_TTSProcessor:
-    """
-    Dynamic TTS processor (Weekly Interview version)
-    Dynamic voice selection, retries, and health checks
-    """
-    def __init__(self):
-        self.voice = config.TTS_VOICE
-        self.rate = config.TTS_SPEED
-        self.available_voices = None
-        self._voices_checked = False
-        self.voice_selection_strategy = "dynamic"
-
-    async def _check_voice_availability(self):
-        if self._voices_checked:
+    # ---------------- Session voice handling ----------------
+    def start_session(self, session_id: str):
+        """Choose & pin one reference file for this session (sticky voice)."""
+        if session_id in self._session_voice_map:
             return
-        voices = await edge_tts.list_voices()
-        self.available_voices = [v["Name"] for v in voices]
-        voice_preferences = [
-            config.TTS_VOICE,
-            *[v for v in self.available_voices if "en-US" in v and "JennyNeural" in v],
-            *[v for v in self.available_voices if "en-US" in v and "Neural" in v],
-            *[v for v in self.available_voices if "en-GB" in v and "Neural" in v],
-            *[v for v in self.available_voices if "en-AU" in v and "Neural" in v],
-            *[v for v in self.available_voices if "en-IN" in v and "Neural" in v],
-            *[v for v in self.available_voices if "en-" in v and "Neural" in v],
-            *[v for v in self.available_voices if "en-" in v],
-        ]
-        seen, unique = set(), []
-        for v in voice_preferences:
-            if v and v not in seen and v in self.available_voices:
-                unique.append(v)
-                seen.add(v)
-        if not unique:
-            raise Exception("NO SUITABLE ENGLISH VOICES FOUND!")
-        self.voice = unique[0]
-        self._voices_checked = True
+        self._session_voice_map[session_id] = self._choose_ref_audio()
 
-    def split_text_optimized(self, text: str) -> List[str]:
+    def end_session(self, session_id: str):
+        """Forget the pinned voice for a session."""
+        self._session_voice_map.pop(session_id, None)
+
+    def _scan_ref_audios(self, ref_dir: Path):
+        patterns = ["*.wav", "*.mp3", "*.flac", "*.ogg", "*.m4a"]
+        pool = []
+        for p in patterns:
+            pool.extend(glob.glob(str(ref_dir / p)))
+        return pool
+
+    def _choose_ref_audio(self) -> Optional[str]:
+        if not self._ref_pool:
+            return None
+        return random.choice(self._ref_pool)
+
+    # ---------------- Public API: streaming ----------------
+    async def generate_ultra_fast_stream(
+        self,
+        text: str,
+        session_id: Optional[str] = None
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Stream audio bytes for the given text.
+        - If Chatterbox has `generate_stream` (sync generator), iterate it directly.
+        - Otherwise, fall back to one-shot `generate` and yield a single chunk.
+        """
         if not text or not text.strip():
-            raise Exception("Empty text for TTS")
-        base_chunk_size = config.TTS_CHUNK_SIZE * 5
-        if len(text) < 100:
-            return [text.strip()]
-        elif len(text) < 300:
-            return [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
-        else:
-            sentences = re.split(r'[.!?]+', text)
-            chunks, current_chunk = [], ""
-            for s in sentences:
-                s = s.strip()
-                if not s:
-                    continue
-                if len(current_chunk) + len(s) > base_chunk_size:
-                    if current_chunk:
-                        chunks.append(current_chunk.strip())
-                    current_chunk = s
-                else:
-                    current_chunk += " " + s if current_chunk else s
-            if current_chunk.strip():
-                chunks.append(current_chunk.strip())
-            return chunks if chunks else [text.strip()]
+            return
 
-    async def generate_ultra_fast_stream(self, text: str) -> AsyncGenerator[bytes, None]:
-        if not text.strip():
-            raise Exception("Empty text for TTS")
-        await self._check_voice_availability()
-        chunks = self.split_text_optimized(text)
-        for i, chunk in enumerate(chunks):
-            audio_data = await self._generate_chunk_audio_with_dynamic_retry(chunk, i + 1)
-            yield audio_data
+        # pin / fetch session voice
+        audio_prompt_path = None
+        if session_id:
+            if session_id not in self._session_voice_map:
+                self.start_session(session_id)
+            audio_prompt_path = self._session_voice_map.get(session_id)
 
-    async def _generate_chunk_audio_with_dynamic_retry(self, chunk: str, idx: int, max_retries: int = 2) -> bytes:
-        for attempt in range(max_retries):
-            try:
-                tts = edge_tts.Communicate(text=chunk, voice=self.voice, rate=self.rate)
-                audio_data = b""
-                async for tts_chunk in tts.stream():
-                    if tts_chunk["type"] == "audio" and tts_chunk["data"]:
-                        audio_data += tts_chunk["data"]
-                if not audio_data:
-                    raise Exception("Empty audio data")
-                return audio_data
-            except Exception as e:
-                logger.error(f"[WI_TTS] Attempt {attempt+1}/{max_retries} failed: {e}")
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(1.0)
+        try:
+            # --- Preferred path: streaming available (sync generator) ---
+            if hasattr(self.model, "generate_stream") and callable(getattr(self.model, "generate_stream")):
+                # NOTE: generate_stream in example_vc_stream.py is a *sync* generator
+                # so we iterate it directly (this may block briefly while yielding).
+                for audio_chunk, _metrics in self.model.generate_stream(
+                    text=text,
+                    audio_prompt_path=audio_prompt_path,
+                    chunk_size=self.chunk_tokens,
+                    temperature=self.temperature,
+                    cfg_weight=self.cfg_weight,
+                    print_metrics=False,
+                ):
+                    yield self._encode_chunk(audio_chunk, self.model.sr)
+                return
 
+            # --- Fallback path: no streaming in this build; use one-shot generate ---
+            if hasattr(self.model, "generate") and callable(getattr(self.model, "generate")):
+                wav = self.model.generate(text=text, audio_prompt_path=audio_prompt_path)
+                # yield once so the frontend still gets "some" audio
+                yield self._encode_chunk(wav, self.model.sr)
+                return
+
+            # Neither method is present
+            raise AttributeError("ChatterboxTTS has neither generate_stream nor generate")
+
+        except Exception as e:
+            logger.error("[TTS] Streaming/generation error: %s", e)
+            return
+
+
+    # ---------------- Health check ----------------
     async def health_check(self) -> dict:
         try:
-            await self._check_voice_availability()
-            test_audio = await self._generate_chunk_audio_with_dynamic_retry("Test", 0, max_retries=1)
-            return {
-                "status": "healthy" if test_audio else "degraded",
-                "voice": self.voice,
-                "voices_found": len(self.available_voices or []),
-            }
+            text = "test"
+            chunks = 0
+            gen = self.model.generate_stream(
+                text=text, audio_prompt_path=None, chunk_size=10,
+                exaggeration=0.7,
+                temperature=0.8, cfg_weight=0.3, print_metrics=False
+            )
+            async for audio_chunk, _m in gen:
+                _ = audio_chunk
+                chunks += 1
+                if chunks >= 1:
+                    break
+            return {"status": "healthy", "chunks": chunks, "device": self.device}
         except Exception as e:
-            return {"status": "unhealthy", "error": str(e)}
+            return {"status": "error", "error": str(e)}
+
+    # ---------------- Encoding helpers ----------------
+    def _encode_chunk(self, tensor_chunk: "torch.Tensor", sr: int) -> bytes:
+        pcm = tensor_chunk.squeeze().detach().cpu().numpy()
+
+        if self.encode == "wav" and HAVE_SF:
+            buf = io.BytesIO()
+            # write 16-bit PCM WAV
+            sf.write(buf, pcm, sr, subtype="PCM_16", format="WAV")
+            return buf.getvalue()
+
+        # Fallback: raw PCM16 frames (little-endian)
+        import numpy as np
+        pcm = pcm.clip(-1.0, 1.0)
+        i16 = (pcm * 32767.0).astype(np.int16)
+        return i16.tobytes()

@@ -155,6 +155,10 @@ class Config:
     # =========================================================================
     # TTS CONFIG (merged)
     # =========================================================================
+    # near other PATHS
+    REF_AUDIO_DIR = (Path(__file__).resolve().parent.parent / "core/ref_audios")
+    TTS_STREAM_ENCODING = os.getenv("TTS_STREAM_ENCODING", "wav")  # "wav" or "pcm16"
+
     # daily_standup fixed style
     TTS_VOICE = os.getenv("TTS_VOICE", "en-IN-PrabhatNeural")
     TTS_RATE = os.getenv("TTS_RATE", "+25%")

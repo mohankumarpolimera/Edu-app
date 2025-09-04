@@ -15,6 +15,7 @@ import base64
 from typing import Dict, Optional, Any
 import io
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import StreamingResponse
@@ -33,7 +34,8 @@ from core.ai_services import (
         WI_EnhancedInterviewFragmentManager as EnhancedInterviewFragmentManager, WI_OptimizedAudioProcessor as OptimizedAudioProcessor,
         WI_OptimizedConversationManager as OptimizedConversationManager,
     )
-from core.tts_processor import WI_TTSProcessor as UltraFastTTSProcessor
+# ⬇️ Unified Chatterbox TTS
+from core.tts_processor import UnifiedTTSProcessor as UltraFastTTSProcessor
 from core.prompts import validate_prompts
 
 logging.basicConfig(level=logging.INFO)
@@ -48,7 +50,11 @@ class UltraFastInterviewManager:
         self.active_sessions: Dict[str, InterviewSession] = {}
         self.db_manager = DatabaseManager(shared_clients)
         self.audio_processor = OptimizedAudioProcessor(shared_clients)
-        self.tts_processor = UltraFastTTSProcessor()
+        # ⬇️ INIT unified TTS
+        self.tts_processor = UltraFastTTSProcessor(
+            ref_audio_dir=getattr(config, "REF_AUDIO_DIR", Path("ref_audios")),
+            encode=getattr(config, "TTS_STREAM_ENCODING", "wav"),
+        )
         self.conversation_manager = OptimizedConversationManager(shared_clients)
 
     async def create_session_fast(self, websocket: Optional[Any] = None) -> InterviewSession:
@@ -96,6 +102,10 @@ class UltraFastInterviewManager:
                 raise Exception("Failed to initialize fragments from 7-day summaries")
 
             session_data.fragment_manager = fragment_manager
+
+            # ⬇️ PIN ONE REFERENCE VOICE FOR THIS SESSION
+            self.tts_processor.start_session(session_data.session_id)
+
             self.active_sessions[session_id] = session_data
 
             logger.info(
@@ -109,6 +119,11 @@ class UltraFastInterviewManager:
 
     async def remove_session(self, session_id: str):
         if session_id in self.active_sessions:
+            # ⬇️ CLEANUP PINNED VOICE
+            try:
+                self.tts_processor.end_session(session_id)
+            except Exception:
+                pass
             del self.active_sessions[session_id]
             logger.info("Removed session %s", session_id)
 
@@ -225,7 +240,7 @@ class UltraFastInterviewManager:
                 "fragments_covered": len([c for c, count in session_data.concept_question_counts.items() if count > 0]),
                 "total_fragments": len(session_data.fragment_keys),
                 "websocket_used": True,
-                "tts_voice": config.TTS_VOICE,
+                "tts_voice": "ref_audio",  # sticky voice via session ref
             }
 
             logger.info("Saving interview data to database")
@@ -246,7 +261,10 @@ class UltraFastInterviewManager:
             })
 
             try:
-                async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(completion_message):
+                # ⬇️ PASS session_id
+                async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
+                    completion_message, session_id=session_data.session_id
+                ):
                     if audio_chunk:
                         await self._send_quick_message(session_data, {
                             "type": "audio_chunk",
@@ -296,7 +314,10 @@ class UltraFastInterviewManager:
             })
             chunk_count = 0
             try:
-                async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(text):
+                # ⬇️ PASS session_id
+                async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
+                    text, session_id=session_data.session_id
+                ):
                     if audio_chunk and session_data.is_active:
                         await self._send_quick_message(session_data, {
                             "type": "audio_chunk",
@@ -434,7 +455,10 @@ async def websocket_endpoint_ultra_fast(websocket: WebSocket, session_id: str):
             try:
                 await websocket.send_text(json.dumps({"type": "ai_response", "text": greeting, "stage": "greeting", "status": "greeting"}))
                 chunk_count = 0
-                async for audio_chunk in interview_manager.tts_processor.generate_ultra_fast_stream(greeting):
+                # ⬇️ PASS session_id for sticky voice
+                async for audio_chunk in interview_manager.tts_processor.generate_ultra_fast_stream(
+                    greeting, session_id=session_id
+                ):
                     if not audio_chunk:
                         raise Exception("Empty audio chunk received from TTS processor")
                     if len(audio_chunk) < 50:
@@ -510,23 +534,6 @@ async def websocket_endpoint_weekly_interview(websocket: WebSocket, session_id: 
     logger.info("Routing weekly_interview WebSocket to main endpoint: %s", session_id)
     await websocket_endpoint_ultra_fast(websocket, session_id)
 
-@app.get("/evaluate")
-async def get_evaluation_fast(test_id: str):
-    try:
-        logger.info("Getting evaluation for test_id: %s", test_id)
-        result = await interview_manager.get_session_result_fast(test_id)
-        return {
-            "test_id": test_id,
-            "evaluation": result.get("evaluation", "Evaluation not available"),
-            "scores": result.get("scores", {}),
-            "analytics": result.get("interview_analytics", {}),
-            "pdf_url": f"/weekly_interview/download_results/{test_id}",
-            "status": "success",
-        }
-    except Exception as e:
-        logger.error("Error getting evaluation: %s", e)
-        raise HTTPException(status_code=500, detail=f"Failed to get evaluation: {str(e)}")
-
 @app.get("/download_results/{test_id}")
 async def download_results_fast(test_id: str):
     try:
@@ -545,89 +552,6 @@ async def download_results_fast(test_id: str):
     except Exception as e:
         logger.error("PDF generation error: %s", e)
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
-
-@app.get("/health")
-async def health_check_fast():
-    try:
-        db_status = {"mysql": False, "mongodb": False}
-        tts_status = {"status": "unknown"}
-        try:
-            db_manager = DatabaseManager(shared_clients)
-            conn = db_manager.get_mysql_connection()
-            conn.close()
-            db_status["mysql"] = True
-            await db_manager.get_mongo_client()
-            db_status["mongodb"] = True
-        except Exception as e:
-            logger.warning("Database health check failed: %s", e)
-
-        try:
-            tts_status = await UltraFastTTSProcessor().health_check()
-        except Exception as e:
-            logger.warning("TTS health check failed: %s", e)
-            tts_status = {"status": "error", "error": str(e)}
-
-        overall_status = "healthy" if (all(db_status.values()) and tts_status.get("status") != "error") else "degraded"
-        return {
-            "status": overall_status,
-            "service": "ultra_fast_interview_system",
-            "timestamp": time.time(),
-            "active_sessions": len(interview_manager.active_sessions),
-            "version": config.APP_VERSION,
-            "database_status": db_status,
-            "tts_status": tts_status,
-            "features": {
-                "7_day_summaries": True,
-                "fragment_based_questions": True,
-                "real_time_streaming": True,
-                "ultra_fast_tts": True,
-                "round_based_interview": True,
-                "modular_tts": True,
-                "fail_loud_debugging": True,
-            },
-        }
-    except Exception as e:
-        logger.error("Health check failed: %s", e)
-        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
-
-@app.get("/api/interview-students")
-async def get_interview_students():
-    try:
-        results = await interview_manager.db_manager.get_all_interview_results_fast(100)
-        students = {}
-        for result in results:
-            student_id = result.get("student_id")
-            if student_id and student_id not in students:
-                students[student_id] = {
-                    "Student_ID": student_id,
-                    "name": result.get("student_name", "Unknown"),
-                }
-        return list(students.values())
-    except Exception as e:
-        logger.error("Get students error: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/interview-students/{student_id}/interviews")
-async def get_student_interviews(student_id: str):
-    try:
-        all_results = await interview_manager.db_manager.get_all_interview_results_fast(200)
-        student_interviews = [
-            {
-                "interview_id": result.get("test_id"),
-                "test_id": result.get("test_id"),
-                "session_id": result.get("session_id"),
-                "timestamp": result.get("timestamp"),
-                "scores": result.get("scores", {}),
-                "Student_ID": result.get("student_id"),
-                "name": result.get("student_name"),
-            }
-            for result in all_results
-            if str(result.get("student_id", "")) == student_id
-        ]
-        return student_interviews
-    except Exception as e:
-        logger.error("Get student interviews error: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
 
 def generate_pdf_report(result: Dict[str, Any], test_id: str) -> bytes:
     try:
